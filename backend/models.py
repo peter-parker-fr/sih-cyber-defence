@@ -341,3 +341,33 @@ class WorldModelPipeline:
             
             return True
         return False
+
+  class TopologyManager:
+      """Maps AI predictions to real-world network assets"""
+      def __init__(self):
+          # This mapping connects MITRE stages to likely target assets
+          self.stage_to_asset = {
+              "Reconnaissance": "DMZ_Web_Server",
+              "Initial Access": "VPN_Gateway",
+              "Lateral Movement": "Internal_App_Server",
+              "Command & Control": "Active_Directory",
+              "Exfiltration": "SQL_Database"
+          }
+          self.isolated_nodes = set()
+
+      def get_target_asset(self, stage):
+          return self.stage_to_asset.get(stage, "Unknown Asset")
+
+      def isolate_node(self, asset_name):
+          self.isolated_nodes.add(asset_name)
+          return True
+
+      def release_node(self, asset_name):
+          self.isolated_nodes.discard(asset_name)
+          return True
+
+      def is_isolated(self, asset_name):
+          return asset_name in self.isolated_nodes
+
+  # Initialize a global topology manager
+  topology_manager = TopologyManager()
