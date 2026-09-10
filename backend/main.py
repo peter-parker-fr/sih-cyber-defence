@@ -1,245 +1,167 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import io
-import pandas as pd
-import numpy as np
-import time
-import os
-from models import WorldModelPipeline, DEVICE
-from data_generator import generate_sample_dataset, generate_sample_csv
-from typing import List, Dict, Any
+  from fastapi.middleware.cors import CORSMiddleware
+  from fastapi.responses import JSONResponse
+  import io
+  import pandas as pd
+  import numpy as np
+  import time
+  import os
+  from models import WorldModelPipeline, DEVICE, topology_manager # Imported topology_manager
+  from data_generator import generate_sample_dataset, generate_sample_csv
+  from typing import List, Dict, Any
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Cyber Threat World Model API",
-    description="LSTM-based predictive cyber defence system",
-    version="1.0.0"
-)
+  # Initialize FastAPI app
+  app = FastAPI(
+      title="Cyber Threat World Model API",
+      description="LSTM-based predictive cyber defence system with Proactive Isolation",
+      version="2.0.0" # Upgraded version
+  )
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+  # Add CORS middleware
+  app.add_middleware(
+      CORSMiddleware,
+      allow_origins=["*"],
+      allow_credentials=True,
+      allow_methods=["*"],
+      allow_headers=["*"],
+  )
 
-# Initialize pipeline
-pipeline = WorldModelPipeline()
-model_loaded = pipeline.load("models")
+  # Initialize pipeline
+  pipeline = WorldModelPipeline()
+  model_loaded = pipeline.load("models")
 
-# Global cache for metrics
-benchmark_metrics = None
-sample_predictions = None
+  # Global cache for metrics
+  benchmark_metrics = None
+  sample_predictions = None
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize models on startup"""
-    global model_loaded, benchmark_metrics, sample_predictions
+  @app.on_event("startup")
+  async def startup_event():
+      global model_loaded, benchmark_metrics, sample_predictions
+      if not model_loaded:
+          try:
+              X_train_raw, y_train, X_test_raw, y_test = generate_sample_dataset(num_samples=500)
+              X_train = pipeline.extract_features(X_train_raw)
+              X_test = pipeline.extract_features(X_test_raw)
+              pipeline.train(X_train, y_train, epochs=15, batch_size=32)
 
-    if not model_loaded:
-        print("No trained model found. Training on sample data...")
-        try:
-            X_train_raw, y_train, X_test_raw, y_test = generate_sample_dataset(num_samples=500)
+              X_test_scaled = pipeline.scaler.transform(X_test.values)
+              y_test_arr = y_test.values if hasattr(y_test, 'values') else y_test
+              X_test_seq, y_test_seq = pipeline.create_sequences(X_test_scaled, y_test_arr, seq_len=5)
+              if len(X_test_seq) > 0:
+                  import torch
+                  X_tensor = torch.from_numpy(X_test_seq).float().to(DEVICE)
+                  with torch.no_grad():
+                      lstm_preds, _ = pipeline.model(X_tensor)
+                      lstm_preds = lstm_preds.cpu().numpy()
+                  X_flat = X_test_seq.reshape(X_test_seq.shape[0], -1)
+                  baseline_preds = pipeline.baseline_model.predict_proba(X_flat)[:, 1]
+                  benchmark_metrics = pipeline.get_benchmark_metrics(y_test_seq, lstm_preds, baseline_preds)
+              pipeline.save("models")
+              model_loaded = True
+          except Exception as e:
+              print(f"Error training model: {e}")
 
-            # FIX: extract numeric features (drops src_ip/dst_ip, encodes flags/ports/etc.)
-            # before anything touches the scaler or the model.
-            X_train = pipeline.extract_features(X_train_raw)
-            X_test = pipeline.extract_features(X_test_raw)
+  @app.get("/")
+  async def root():
+      return {"status": "online", "service": "Cyber Threat World Model API", "version": "2.0.0"}
 
-            # Train model
-            pipeline.train(X_train, y_train, epochs=15, batch_size=32)
+  # --- NEW ENTERPRISE ENDPOINTS ---
 
-            # Calculate benchmark metrics
-            X_test_scaled = pipeline.scaler.transform(X_test.values)
-            y_test_arr = y_test.values if hasattr(y_test, 'values') else y_test
-            X_test_seq, y_test_seq = pipeline.create_sequences(X_test_scaled, y_test_arr, seq_len=5)
-            if len(X_test_seq) > 0:
-                import torch
-                # FIX: pipeline.model.device doesn't exist on a plain nn.Module.
-                # Use the DEVICE constant imported from models.py instead.
-                X_tensor = torch.from_numpy(X_test_seq).float().to(DEVICE)
+  @app.get("/network-state")
+  async def get_network_state():
+      """Returns the current state of isolated nodes"""
+      return {
+          "status": "success",
+          "isolated_nodes": list(topology_manager.isolated_nodes),
+          "total_isolated": len(topology_manager.isolated_nodes)
+      }
 
-                with torch.no_grad():
-                    lstm_preds, _ = pipeline.model(X_tensor)
-                    lstm_preds = lstm_preds.cpu().numpy()
+  @app.post("/isolate")
+  async def isolate_node(asset: Dict[str, str]):
+      """Isolate a predicted target asset to block the attack"""
+      asset_name = asset.get("name")
+      if not asset_name:
+          raise HTTPException(status_code=400, detail="Asset name required")
 
-                X_flat = X_test_seq.reshape(X_test_seq.shape[0], -1)
-                baseline_preds = pipeline.baseline_model.predict_proba(X_flat)[:, 1]
+      topology_manager.isolate_node(asset_name)
+      return {"status": "success", "message": f"Asset {asset_name} has been isolated."}
 
-                benchmark_metrics = pipeline.get_benchmark_metrics(y_test_seq, lstm_preds, baseline_preds)
-                print(f"Benchmark Metrics: {benchmark_metrics}")
+  @app.post("/release")
+  async def release_node(asset: Dict[str, str]):
+      """Release a node from isolation"""
+      asset_name = asset.get("name")
+      topology_manager.release_node(asset_name)
+      return {"status": "success", "message": f"Asset {asset_name} is now online."}
 
-            # Save models
-            pipeline.save("models")
-            model_loaded = True
+  # --- MODIFIED PREDICT ENDPOINT ---
 
-        except Exception as e:
-            print(f"Error training model: {e}")
-            import traceback
-            traceback.print_exc()
+  @app.post("/predict")
+  async def predict(file: UploadFile = File(...)):
+      if not model_loaded:
+          raise HTTPException(status_code=503, detail="Model not ready")
 
-@app.get("/")
-async def root():
-    """API health check"""
-    return {
-        "status": "online",
-        "service": "Cyber Threat World Model API",
-        "model_loaded": model_loaded,
-        "version": "1.0.0"
-    }
+      try:
+          contents = await file.read()
+          df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+          if df.empty: raise HTTPException(status_code=400, detail="CSV is empty")
+          if len(df) < 5: raise HTTPException(status_code=400, detail="Min 5 flows required")
 
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "model_ready": model_loaded,
-        "timestamp": str(pd.Timestamp.now())
-    }
+          start_time = time.time()
+          features = pipeline.extract_features(df)
+          predictions = pipeline.predict(features, seq_len=5, k_steps=3)
+          inference_time = time.time() - start_time
 
-@app.get("/sample-data")
-async def get_sample_data():
-    """Download sample dataset"""
-    try:
-        csv_content = generate_sample_csv()
-        return {
-            "status": "success",
-            "data": csv_content[:50],  # First 50 rows as preview
-            "total_rows": len(csv_content.split('\n')),
-            "filename": "sample_network_traffic.csv"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+          # World Model Logic: Map MITRE stages to Assets
+          top_stage = predictions['mitre_stages'][0]
+          target_asset = topology_manager.get_target_asset(top_stage)
 
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    """
-    Predict infiltration probability and MITRE ATT&CK stages
+          # CHECK IF THE PREDICTED TARGET IS ALREADY ISOLATED
+          is_blocked = topology_manager.is_isolated(target_asset)
+          verdict = "BLOCKED" if is_blocked else "ALLOWED"
 
-    Expected CSV format:
-    src_ip, dst_ip, src_port, dst_port, protocol, bytes, packets, duration, tcp_flags, iat_mean, iat_var, iat_max
-    """
-    if not model_loaded:
-        raise HTTPException(status_code=503, detail="Model not ready")
+          avg_infiltration = float(np.mean(predictions['lstm_probabilities']))
+          max_infiltration = float(np.max(predictions['lstm_probabilities']))
+          stage_distribution = {}
+          for stage in predictions['mitre_stages']:
+              stage_distribution[stage] = stage_distribution.get(stage, 0) + 1
 
-    try:
-        # Read uploaded file
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+          return {
+              "status": "success",
+              "verdict": verdict,
+              "predicted_target": target_asset,
+              "predictions": {
+                  "lstm_probabilities": predictions['lstm_probabilities'],
+                  "mitre_stages": predictions['mitre_stages'],
+                  "average_infiltration_probability": avg_infiltration,
+                  "max_infiltration_probability": max_infiltration,
+                  "stage_distribution": stage_distribution
+              },
+              "explainability": {
+                  "top_features": predictions['top_features'],
+                  "feature_names": predictions['feature_names']
+              },
+              "inference_time_ms": round(inference_time * 1000, 2),
+              "flows_analyzed": len(df)
+          }
+      except Exception as e:
+          raise HTTPException(status_code=500, detail=str(e))
 
-        # Validate
-        if df.empty:
-            raise HTTPException(status_code=400, detail="CSV is empty")
+  @app.get("/benchmark")
+  async def get_benchmark():
+      global benchmark_metrics
+      if benchmark_metrics is None:
+          raise HTTPException(status_code=503, detail="Benchmark data not available")
+      return {"status": "success", "metrics": benchmark_metrics}
 
-        if len(df) < 5:
-            raise HTTPException(status_code=400, detail="Minimum 5 flows required for prediction")
+  @app.get("/model-info")
+  async def get_model_info():
+      return {
+          "status": "success",
+          "model_type": "LSTM (Enterprise Edition)",
+          "mitre_stages": ["Reconnaissance", "Initial Access", "Lateral Movement", "Command & Control", "Exfiltration"],
+          "device": str(DEVICE) if pipeline.model else "cpu"
+      }
 
-        # Extract features and predict
-        start_time = time.time()
-        features = pipeline.extract_features(df)
-        predictions = pipeline.predict(features, seq_len=5, k_steps=3)
-        inference_time = time.time() - start_time
-
-        # Aggregate predictions
-        avg_infiltration = float(np.mean(predictions['lstm_probabilities']))
-        max_infiltration = float(np.max(predictions['lstm_probabilities']))
-        stage_distribution = {}
-        for stage in predictions['mitre_stages']:
-            stage_distribution[stage] = stage_distribution.get(stage, 0) + 1
-
-        return {
-            "status": "success",
-            "predictions": {
-                "lstm_probabilities": predictions['lstm_probabilities'],
-                "baseline_probabilities": predictions['baseline_probabilities'],
-                "mitre_stages": predictions['mitre_stages'],
-                "timestamps": predictions['timestamps'],
-                "average_infiltration_probability": avg_infiltration,
-                "max_infiltration_probability": max_infiltration,
-                "stage_distribution": stage_distribution
-            },
-            "explainability": {
-                "top_features": predictions['top_features'],
-                "feature_names": predictions['feature_names']
-            },
-            "inference_time_ms": round(inference_time * 1000, 2),
-            "flows_analyzed": len(df)
-        }
-
-    except pd.errors.ParserError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV format: {str(e)}")
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# FIX: was @app.post("/benchmark") — the frontend calls this with GET,
-# which caused a 405 Method Not Allowed. This just reads cached metrics,
-# so GET is the correct verb anyway.
-@app.get("/benchmark")
-async def get_benchmark():
-    """Get benchmark metrics"""
-    global benchmark_metrics
-
-    if benchmark_metrics is None:
-        raise HTTPException(status_code=503, detail="Benchmark data not available")
-
-    return {
-        "status": "success",
-        "metrics": benchmark_metrics,
-        "timestamp": str(pd.Timestamp.now())
-    }
-
-@app.get("/sample-analysis")
-async def get_sample_analysis():
-    """Get pre-computed analysis on sample data"""
-    global sample_predictions
-
-    try:
-        if sample_predictions is None:
-            # Generate and cache sample predictions
-            X_sample_raw, _, _, _ = generate_sample_dataset(num_samples=50)
-
-            # FIX: extract_features() was never called here either — same
-            # "raw IP strings hit the scaler" bug as startup_event had.
-            features = pipeline.extract_features(X_sample_raw.head(20))
-            sample_predictions = pipeline.predict(features, seq_len=5)
-
-            # Add benchmark data
-            global benchmark_metrics
-            sample_predictions['benchmark'] = benchmark_metrics
-
-        return {
-            "status": "success",
-            "predictions": sample_predictions
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/model-info")
-async def get_model_info():
-    """Get information about the model"""
-    return {
-        "status": "success",
-        "model_type": "LSTM (2 layers, 64 hidden units)",
-        "baseline_type": "Logistic Regression",
-        "features": pipeline.feature_names,
-        "feature_count": len(pipeline.feature_names) if pipeline.feature_names else 0,
-        "mitre_stages": [
-            "Reconnaissance",
-            "Initial Access",
-            "Lateral Movement",
-            "Command & Control",
-            "Exfiltration"
-        ],
-        # FIX: pipeline.model.device doesn't exist — use DEVICE constant.
-        "device": str(DEVICE) if pipeline.model else "cpu"
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+  if __name__ == "__main__":
+      import uvicorn
+      uvicorn.run(app, host="0.0.0.0", port=8000)
