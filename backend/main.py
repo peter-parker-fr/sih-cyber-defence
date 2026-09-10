@@ -165,3 +165,46 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
   if __name__ == "__main__":
       import uvicorn
       uvicorn.run(app, host="0.0.0.0", port=8000)
+ from fastapi import FastAPI, HTTPException
+  from fastapi.middleware.cors import CORSMiddleware
+  from models import engine, DEVICE
+  import pandas as pd
+
+  app = FastAPI(title="CyberWorld Simulation API")
+
+  app.add_middleware(
+      CORSMiddleware,
+      allow_origins=["*"],
+      allow_credentials=True,
+      allow_methods=["*"],
+      allow_headers=["*"],
+  )
+
+  @app.get("/state")
+  async def get_state():
+      """Returns the full current state of the world"""
+      return {
+          "attacker_position": engine.attacker_pos,
+          "isolated_nodes": list(engine.isolated_nodes),
+          "history": engine.history,
+          "blocked_attacks": engine.blocked_count,
+          "topology": engine.topology
+      }
+
+  @app.post("/simulate")
+  async def simulate_move():
+      """Triggers a movement in the world model"""
+      result = engine.move_attacker()
+      return result
+
+  @app.post("/isolate")
+  async def isolate_node(node_name: str):
+      """Isolates a specific node"""
+      engine.isolate(node_name)
+      return {"status": "success", "message": f"Node {node_name} isolated."}
+
+  @app.post("/reset")
+  async def reset_sim():
+      """Resets the simulation"""
+      engine.reset()
+      return {"status": "success", "message": "Simulation reset."}
